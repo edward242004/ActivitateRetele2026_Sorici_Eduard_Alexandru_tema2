@@ -1,93 +1,222 @@
 import socket
+import json
+import os
+import threading
 
-HOST        = '127.0.0.1'
-PORT        = 9999
-BUFFER_SIZE = 1024
+# Configuration
+SERVER_HOST = 'localhost'
+SERVER_PORT = 5000
+FILES_DIR = 'files'
+DEFAULT_USER = 'student'
+DEFAULT_PASSWORD = '1234'
+FILE_HISTORY = {}
 
-clienti_conectati = {}
-mesaje = []
-id_contor = 1
+def ensure_files_dir():
+    """Ensure files directory exists"""
+    if not os.path.exists(FILES_DIR):
+        os.makedirs(FILES_DIR)
+        print(f"✓ Directory '{FILES_DIR}' created")
 
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server_socket.bind((HOST, PORT))
 
-print("=" * 50)
-print(f"  SERVER UDP pornit pe {HOST}:{PORT}")
-print("  Asteptam mesaje de la clienti...")
-print("=" * 50)
+def add_history(filename, action, details=''):
+    """Record an operation for a file"""
+    history = FILE_HISTORY.setdefault(filename, [])
+    entry = action if not details else f"{action}: {details}"
+    history.append(entry)
 
-while True:
+
+def get_history_text(filename):
+    """Format the history for display"""
+    history = FILE_HISTORY.get(filename)
+    if not history:
+        return None
+    return "\n".join(f"{i}. {entry}" for i, entry in enumerate(history, 1))
+
+
+def authenticate(username, password):
+    """Authenticate user"""
+    return username == DEFAULT_USER and password == DEFAULT_PASSWORD
+
+
+def handle_client(conn, addr):
+    """Handle client connection"""
+    print(f"\n🔗 Client connected from {addr}")
+    authenticated = False
+    current_user = None
+    
     try:
-        date_brute, adresa_client = server_socket.recvfrom(BUFFER_SIZE)
-        mesaj_primit = date_brute.decode('utf-8').strip()
-
-        parti = mesaj_primit.split(' ', 1)
-        comanda = parti[0].upper()
-        argumente = parti[1] if len(parti) > 1 else ''
-
-        print(f"\n[PRIMIT] De la {adresa_client}: '{mesaj_primit}'")
-
-        if comanda != 'CONNECT' and adresa_client not in clienti_conectati:
-            raspuns = "EROARE: Trebuie sa fii conectat pentru a folosi aceasta comanda."
-
-        elif comanda == 'CONNECT':
-            if adresa_client in clienti_conectati:
-                raspuns = "EROARE: Esti deja conectat la server."
-            else:
-                clienti_conectati[adresa_client] = True
-                nr_clienti = len(clienti_conectati)
-                raspuns = f"OK: Conectat cu succes. Clienti activi: {nr_clienti}"
-                print(f"[SERVER] Client nou conectat: {adresa_client}")
-
-        elif comanda == 'DISCONNECT':
-            if adresa_client in clienti_conectati:
-                del clienti_conectati[adresa_client]
-                raspuns = "OK: Deconectat cu succes. La revedere!"
-                print(f"[SERVER] Client deconectat: {adresa_client}")
-            else:
-                raspuns = "EROARE: Nu esti conectat la server."
-
-        elif comanda == 'PUBLISH':
-            if not argumente:
-                raspuns = "EROARE: Mesajul nu poate fi gol."
-            else:
-                nou_mesaj = {"id": id_contor, "autor": adresa_client, "text": argumente}
-                mesaje.append(nou_mesaj)
-                raspuns = f"OK: Mesaj publicat cu ID={id_contor}"
-                id_contor += 1
-
-        elif comanda == 'DELETE':
+        while True:
+            # Receive request
+            request_data = conn.recv(4096).decode('utf-8')
+            if not request_data:
+                break
+            
             try:
-                id_de_sters = int(argumente)
-                mesaj_gasit = next((m for m in mesaje if m["id"] == id_de_sters), None)
+                request = json.loads(request_data)
+                command = request.get('command')
+                
+                print(f"📨 Command received: {command}")
+                
+                # Authentication
+                if command == 'login':
+                    username = request.get('username')
+                    password = request.get('password')
+                    
+                    if authenticate(username, password):
+                        authenticated = True
+                        current_user = username
+                        response = {'status': 'success', 'message': f'Welcome {username}!'}
+                        print(f"✓ User {username} authenticated")
+                    else:
+                        response = {'status': 'error', 'message': 'Invalid credentials'}
+                        print(f"✗ Authentication failed for user {username}")
+                
+                elif not authenticated:
+                    response = {'status': 'error', 'message': 'Not authenticated. Use login first'}
+                
+                # File operations
+                elif command == 'create_file':
+                    filename = request.get('filename')
+                    content = request.get('content', '')
+                    
+                    filepath = os.path.join(FILES_DIR, filename)
+                    with open(filepath, 'w') as f:
+                        f.write(content)
+                    add_history(filename, 'CREATE', 'file created on server')
+                    
+                    response = {'status': 'success', 'message': f'File {filename} created on server'}
+                    print(f"✓ File created: {filename}")
+                
+                elif command == 'upload':
+                    filename = request.get('filename')
+                    content = request.get('content')
+                    
+                    filepath = os.path.join(FILES_DIR, filename)
+                    with open(filepath, 'w') as f:
+                        f.write(content)
+                    add_history(filename, 'UPLOAD', 'file uploaded from client')
+                    
+                    response = {'status': 'success', 'message': f'File {filename} uploaded'}
+                    print(f"✓ File uploaded: {filename}")
+                
+                elif command == 'rename_file':
+                    old_name = request.get('old_name')
+                    new_name = request.get('new_name')
+                    old_path = os.path.join(FILES_DIR, old_name)
+                    new_path = os.path.join(FILES_DIR, new_name)
 
-                if not mesaj_gasit:
-                    raspuns = f"EROARE: Mesajul cu ID={id_de_sters} nu exista."
-                elif mesaj_gasit["autor"] != adresa_client:
-                    raspuns = "EROARE: Poti sterge doar mesajele proprii!"
+                    if os.path.exists(old_path):
+                        os.rename(old_path, new_path)
+                        old_history = FILE_HISTORY.pop(old_name, [])
+                        FILE_HISTORY[new_name] = old_history
+                        add_history(new_name, 'RENAME', f'{old_name} -> {new_name}')
+                        response = {'status': 'success', 'message': f'File renamed from {old_name} to {new_name}'}
+                    else:
+                        response = {'status': 'error', 'message': f'File {old_name} not found'}
+                
+                elif command == 'read_file':
+                    filename = request.get('filename')
+                    filepath = os.path.join(FILES_DIR, filename)
+
+                    if os.path.exists(filepath):
+                        with open(filepath, 'r') as f:
+                            content = f.read()
+                        add_history(filename, 'READ', 'file content requested')
+                        response = {'status': 'success', 'content': content, 'message': 'File read successfully'}
+                    else:
+                        response = {'status': 'error', 'message': 'File not found'}
+                
+                elif command == 'download':
+                    filename = request.get('filename')
+                    filepath = os.path.join(FILES_DIR, filename)
+
+                    if os.path.exists(filepath):
+                        with open(filepath, 'r') as f:
+                            content = f.read()
+                        add_history(filename, 'DOWNLOAD', 'file downloaded by client')
+                        response = {'status': 'success', 'filename': filename, 'content': content}
+                    else:
+                        response = {'status': 'error', 'message': 'File not found on server'}
+                
+                elif command == 'edit_file':
+                    filename = request.get('filename')
+                    new_content = request.get('content')
+                    filepath = os.path.join(FILES_DIR, filename)
+
+                    if os.path.exists(filepath):
+                        with open(filepath, 'w') as f:
+                            f.write(new_content)
+                        add_history(filename, 'EDIT', 'file content updated')
+                        response = {'status': 'success', 'message': f'File {filename} updated'}
+                    else:
+                        response = {'status': 'error', 'message': 'File not found'}
+                
+                elif command == 'see_file_operation_history':
+                    filename = request.get('filename')
+                    history_text = get_history_text(filename)
+                    if history_text:
+                        response = {'status': 'success', 'message': f'History for {filename}:\n{history_text}'}
+                    else:
+                        response = {'status': 'error', 'message': f'No history found for {filename}'}
+                
+                elif command == 'list_files':
+                    files = os.listdir(FILES_DIR)
+                    response = {'status': 'success', 'files': files}
+                    print(f"✓ Files listed: {len(files)} files found")
+                
+                elif command == 'logout':
+                    authenticated = False
+                    current_user = None
+                    response = {'status': 'success', 'message': 'Logged out'}
+                    print(f"✓ User logged out")
+                
                 else:
-                    mesaje.remove(mesaj_gasit)
-                    raspuns = f"OK: Mesajul {id_de_sters} a fost sters."
-            except ValueError:
-                raspuns = "EROARE: ID-ul trebuie sa fie numar intreg."
-
-        elif comanda == 'LIST':
-            if not mesaje:
-                raspuns = "INFO: Nu exista mesaje publicate."
-            else:
-                linii = [f"ID={m['id']} | Autor={m['autor']} | Text: {m['text']}" for m in mesaje]
-                raspuns = "LISTA MESAJE:\n" + "\n".join(linii) 
-
-        else:
-            raspuns = f"EROARE: Comanda '{comanda}' este necunoscuta."
-
-        server_socket.sendto(raspuns.encode('utf-8'), adresa_client)
-        print(f"[TRIMIS]  Catre {adresa_client}: '{raspuns}'")
-
-    except KeyboardInterrupt:
-        print("\n[SERVER] Oprire server...")
-        break
+                    response = {'status': 'error', 'message': f'Unknown command: {command}'}
+                
+            except Exception as e:
+                response = {'status': 'error', 'message': str(e)}
+                print(f"✗ Error: {str(e)}")
+            
+            # Send response
+            conn.send(json.dumps(response).encode('utf-8'))
+    
     except Exception as e:
-        print(f"[EROARE] {e}")
+        print(f"✗ Connection error: {str(e)}")
+    finally:
+        conn.close()
+        print(f"🔌 Client disconnected from {addr}")
 
-server_socket.close()
+
+def start_server():
+    """Start FTP server"""
+    ensure_files_dir()
+    
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((SERVER_HOST, SERVER_PORT))
+    server_socket.listen(5)
+    
+    print("=" * 60)
+    print("🚀 FTP SERVER STARTED")
+    print("=" * 60)
+    print(f"Host: {SERVER_HOST}")
+    print(f"Port: {SERVER_PORT}")
+    print(f"Files Directory: {FILES_DIR}")
+    print(f"Default User: {DEFAULT_USER}")
+    print(f"Default Password: {DEFAULT_PASSWORD}")
+    print("=" * 60)
+    
+    try:
+        while True:
+            conn, addr = server_socket.accept()
+            client_thread = threading.Thread(target=handle_client, args=(conn, addr))
+            client_thread.daemon = True
+            client_thread.start()
+    except KeyboardInterrupt:
+        print("\n\n⛔ Server shutting down...")
+    finally:
+        server_socket.close()
+
+
+if __name__ == '__main__':
+    start_server()
